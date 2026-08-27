@@ -240,14 +240,14 @@ console.log('== 6. outbound 合并/分段/兜底（mock） ==')
   out2.onSessionEvent(sess, { type: 'assistant/message', data: { turn: 1, message: { content: [{ type: 'text', text: '第一段' }] } } })
   out2.onSessionEvent(sess, { type: 'assistant/message', data: { turn: 1, message: { content: [{ type: 'text', text: '第二段' }] } } })
   ok('合并窗口内未立即发送', sent.length === 0)
-  fire()
+  await new Promise((r) => setTimeout(r, 950)) // v0.1.3 审计: 原生定时器, 真实等待 flush 窗口
   ok('窗口到期合并为一条', sent.length === 1 && sent[0].b[0].text === '第一段\n\n第二段')
 
   // 被动预算：beginTurn 后首次发送带 msg_id
   sent.length = 0
   out2.beginTurn('qq:user:O1', 'MSG_9')
   out2.onSessionEvent(sess, { type: 'assistant/message', data: { turn: 2, message: { content: [{ type: 'text', text: '回复' }] } } })
-  fire()
+  await new Promise((r) => setTimeout(r, 950)) // v0.1.3 审计: 原生定时器, 真实等待
   ok('被动回复带 msg_id', sent.length === 1 && sent[0].o.passive === true && sent[0].o.msgId === 'MSG_9')
 
   // 错误兜底：turn/end error 且无内容
@@ -300,8 +300,9 @@ console.log('== 7. approval 桥（mock） ==')
 
   // 超时 → unavailable（fail-closed）
   const promise2 = bridge.handle({ agent: { session: { id: 'qq:user:O1' } }, toolName: 'fs' }, nextFn)
-  await new Promise((r) => setTimeout(r, 0))
-  fire()
+  // v0.1.3 审计: 审批超时改原生 setTimeout(approvalTimeoutMs=1000) 且 unref;
+  // 测试需用保活的 ref 定时器撑住事件循环, 等原生超时触发后再取结果
+  await new Promise((r) => setTimeout(r, 1200))
   const outcome2 = await promise2
   ok('超时 → unavailable（fail-closed）', outcome2 === 'unavailable')
 

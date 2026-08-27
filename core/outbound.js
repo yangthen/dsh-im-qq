@@ -14,7 +14,7 @@
  *     「服务暂时不可用，请稍后重试」（绝不静默无响应）
  */
 
-import { stripInternalTags, chunkText, textFromBlocks } from '../lib/util.js'
+import { stripInternalTags, chunkText, textFromBlocks, sleep } from '../lib/util.js'
 
 const FALLBACK_TEXT = '服务暂时不可用，请稍后重试'
 
@@ -36,6 +36,7 @@ export class Outbound {
     this.buffers = new Map() // sessionId → buffer
     this.turnHasContent = new Map() // sessionId → Set<turn>（该 turn 是否有 assistant/message）
     this.pendingPassive = new Map() // sessionId → { msgId, used }（入站消息的被动预算，buffer 创建时消费）
+    this.lastActive = new Map() // sessionId → ts（TTL 清理用，v0.1.3 审计）
   }
 
   /** 注册 session/event 监听（插件生命周期内自动清理）。 */
@@ -54,6 +55,8 @@ export class Outbound {
 
   onSessionEvent(session, event) {
     if (!session.id.startsWith('qq:')) return
+    // v0.1.3：记录最近活跃时间（TTL 清理用）
+    this.lastActive.set(session.id, Date.now())
     // ⚠️ session/event 的负载在 event.data 里（dsh-session append() 构造
     //    {type, seq, time, data, ...}），顶层只有 type/seq/time——读顶层字段
     //    会全部 undefined，导致回复被静默丢弃（曾实机复现：agent 正常出话但 QQ 无回复）
@@ -109,8 +112,12 @@ export class Outbound {
         passive: pp ?? { msgId: null, used: 0 },
       }
       this.pendingPassive.delete(session.id)
-      b.flushTimer = this.ctx.timer.timeout(() => this.flush(session.id), this.cfg.deliverWindowMs)
-      b.maxTimer = this.ctx.timer.timeout(() => this.flush(session.id), this.cfg.deliverMaxWaitMs)
+      // ⚠️ v0.1.3 审计：flush 定时器改原生 setTimeout（脱离 ctx.timer——timer 服务异常时
+      //   缓冲永不 flush 导致"agent 出话但 QQ 无回复"的静默故障）。
+      b.flushTimer = setTimeout(() => this.flush(session.id), this.cfg.deliverWindowMs)
+      b.flushTimer.unref?.()
+      b.maxTimer = setTimeout(() => this.flush(session.id), this.cfg.deliverMaxWaitMs)
+      b.maxTimer.unref?.()
       this.buffers.set(session.id, b)
     }
     const cleaned = stripInternalTags(text)
@@ -121,8 +128,8 @@ export class Outbound {
   async flush(sessionId) {
     const b = this.buffers.get(sessionId)
     if (!b) return
-    b.flushTimer?.()
-    b.maxTimer?.()
+    if (b.flushTimer) clearTimeout(b.flushTimer)
+    if (b.maxTimer) clearTimeout(b.maxTimer)
     this.buffers.delete(sessionId)
     this.pendingPassive.delete(sessionId)
 
@@ -132,7 +139,9 @@ export class Outbound {
     // 分段：> textChunkLimit 拆多条；串行发送（防乱序 + 降频控）。
     // ⚠️ 全部走被动回复（官方：主动消息每月限 4 条/人/群，超限发送失败）——
     //    被动回复限 replyPassiveLimit 次/消息，预算内绝不落主动
+    // v0.1.3：分块之间按 interMessageDelayMs 节流（借鉴 Hermes RATE_LIMIT_DELAY 主动频控思路）。
     const chunks = chunkText(text, this.cfg.textChunkLimit)
+    const delayMs = Number(this.cfg.interMessageDelayMs) || 0
     for (let index = 0; index < chunks.length; index += 1) {
       const chunk = chunks[index]
       const passive = b.passive.msgId && b.passive.used < this.cfg.replyPassiveLimit
@@ -145,6 +154,7 @@ export class Outbound {
       } catch (err) {
         this.log.error('出站发送失败:', err?.message)
       }
+      if (delayMs > 0 && index < chunks.length - 1) await sleep(delayMs)
     }
   }
 
@@ -164,5 +174,34 @@ export class Outbound {
     } catch (err) {
       this.log.error('兜底发送失败:', err?.message)
     }
+  }
+
+  /**
+   * 清理空闲会话的残留内存（v0.1.3 审计：turnHasContent/lastActive/pendingPassive 防无界增长）。
+   * 只清内存记录；会话映射由 session-map 负责（保留以支持懒恢复）。
+   * @param {number} maxIdleMs 超过该时长无活跃则清理；<=0 表示禁用
+   * @returns {number} 清理的会话记录数
+   */
+  pruneIdle(maxIdleMs) {
+    if (!maxIdleMs || maxIdleMs <= 0) return 0
+    const now = Date.now()
+    let removed = 0
+    for (const [sessionId, ts] of this.lastActive) {
+      if (now - ts > maxIdleMs) {
+        this.turnHasContent.delete(sessionId)
+        this.pendingPassive.delete(sessionId)
+        // 有未 flush 的缓冲则立即发送（避免丢回复），再清理
+        if (this.buffers.has(sessionId)) this.flush(sessionId).catch(() => {})
+        this.lastActive.delete(sessionId)
+        removed += 1
+      }
+    }
+    // 兜底：清掉没有 lastActive 记录的孤儿记录
+    if (this.turnHasContent.size > this.lastActive.size + 64) {
+      for (const [sessionId] of this.turnHasContent) {
+        if (!this.lastActive.has(sessionId)) this.turnHasContent.delete(sessionId)
+      }
+    }
+    return removed
   }
 }

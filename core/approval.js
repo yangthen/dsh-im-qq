@@ -72,19 +72,22 @@ export class ApprovalBridge {
     }
 
     // 等待按钮回调；超时 fail-closed
+    // ⚠️ v0.1.3 审计：超时改用原生 setTimeout（脱离 ctx.timer——timer 服务异常时
+    //   审批会永久挂起导致 agent 回合卡死，与 2026-08-27 事故同类隐患）。
     return new Promise((resolve) => {
-      const timer = this.ctx.timer.timeout(() => {
+      const timeout = setTimeout(() => {
         this.pending.delete(requestId)
         this.log.warn(`审批 ${requestId} 超时（${this.cfg.approvalTimeoutMs}ms），自动拒绝`)
         resolve('unavailable')
       }, this.cfg.approvalTimeoutMs)
+      timeout.unref?.()
       this.pending.set(requestId, {
         chat,
         // 发起审批时的最近入站作者（审批点击者身份校验：只有发起者能点）
         initiator: this.sessionMap.authorFor(chat.chatKey) || '',
         resolve: (outcome) => {
           this.pending.delete(requestId)
-          timer()
+          clearTimeout(timeout)
           resolve(outcome)
         },
         settled: false,

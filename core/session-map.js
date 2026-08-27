@@ -86,6 +86,7 @@ export class SessionMap {
           chat,
           handle: null, // 懒恢复
           createdAt: rec.createdAt ?? Date.now(),
+          lastActiveAt: rec.lastActiveAt ?? Date.now(),
         })
       }
       this.log.info(`已恢复 ${this.entries.size} 个 QQ 会话映射`)
@@ -101,7 +102,12 @@ export class SessionMap {
     try {
       const data = {}
       for (const [chatKey, e] of this.entries) {
-        data[chatKey] = { sessionId: e.sessionId, generation: e.generation, createdAt: e.createdAt }
+        data[chatKey] = {
+          sessionId: e.sessionId,
+          generation: e.generation,
+          createdAt: e.createdAt,
+          lastActiveAt: e.lastActiveAt,
+        }
       }
       writeFileSync(this.mapFile, JSON.stringify(data, null, 2), 'utf8')
     } catch (err) {
@@ -172,6 +178,12 @@ export class SessionMap {
   async deliverCore(chatKey, chat, text, message) {
     let entry = this.entries.get(chatKey)
     this.setAuthor(chatKey, message?.authorOpenid)
+    // v0.1.3：记录最近活跃时间（TTL 清理用）
+    const now = Date.now()
+    if (entry) {
+      entry = { ...entry, lastActiveAt: now }
+      this.entries.set(chatKey, entry)
+    }
 
     // 1. live agent 复用（⚠️ ctx.agents.get(id) 返回 agent 本身，不是 handle）
     let agent = entry?.sessionId ? this.ctx.agents.get(entry.sessionId) : undefined
@@ -274,5 +286,39 @@ export class SessionMap {
   /** sessionId 生成：首个会话 = chatKey，之后 chatKey#<generation>（前缀保持 qq:）。 */
   newSessionId(chatKey, generation = 0) {
     return generation === 0 ? chatKey : `${chatKey}#${generation}`
+  }
+
+  /**
+   * 清理空闲会话（v0.1.3 审计修正：只释放 live agent 句柄，**保留映射**）。
+   *
+   * ⚠️ 不能删除 entries 项：映射里的 sessionId/generation 是"按原会话懒恢复"与
+   *   "新会话 id 不冲突"的依据。若删掉映射，用户回来时会新建一个与磁盘旧会话
+   *   同 id 的会话（sessionId 冲突、历史错乱）。因此：
+   *   - dispose live agent 句柄（真正的大内存：agent 上下文/工具链）
+   *   - 保留轻量映射（~百字节/条），下次发消息按原 sessionId resume
+   *   - 顺带清理 authors 记录（防增长）
+   * @param {number} maxIdleMs 超过该时长无活跃则释放句柄；<=0 表示禁用
+   * @returns {number} 释放句柄数
+   */
+  pruneIdle(maxIdleMs) {
+    if (!maxIdleMs || maxIdleMs <= 0) return 0
+    const now = Date.now()
+    let released = 0
+    for (const [chatKey, e] of this.entries) {
+      const idleFor = now - (e.lastActiveAt || e.createdAt || now)
+      if (idleFor > maxIdleMs) {
+        if (e.handle) {
+          e.handle.dispose().catch((err) => this.log.error(`清理空闲会话 ${chatKey} 时 dispose 失败:`, err?.message))
+          this.entries.set(chatKey, { ...e, handle: null, lastActiveAt: now })
+          released += 1
+        }
+        // author 记录随空闲一起清（保留映射，但 author 是纯内存的最近作者缓存）
+        this.authors.delete(chatKey)
+      }
+    }
+    if (released > 0) {
+      this.log.info(`已释放 ${released} 个空闲会话的 agent 句柄（TTL=${Math.round(maxIdleMs / 86400000)}d，映射保留可恢复）`)
+    }
+    return released
   }
 }

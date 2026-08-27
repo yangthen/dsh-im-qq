@@ -70,8 +70,8 @@ export const Config = z.object({
   agentPreset: z.string().default('standard'),
   cwd: z.string().default('~/qq-workspace'),
   workspaceIsolation: z.boolean().default(true),
-  allowFrom: z.array(z.string()).default(['*']), // 空=全拒（fail-closed）
-  groupAllowFrom: z.array(z.string()).default(['*']),
+  allowFrom: z.array(z.string()).default([]), // 空=全拒（fail-closed）；显式配 '*' 才放行
+  groupAllowFrom: z.array(z.string()).default([]),
   markdown: z.boolean().default(false), // msg_type 2，需平台开通权限
   typing: z.boolean().default(true), // P4 实测确认接口后实现
   streaming: z.boolean().default(false), // P4 实测确认接口后实现
@@ -84,6 +84,15 @@ export const Config = z.object({
   approvalTimeoutMs: z.number().default(300000),
   slashCommands: z.boolean().default(true),
   debug: z.boolean().default(false),
+  /** 断连看门狗：WS 断连超过该毫秒数仍未恢复连接时，主动退出进程（0 = 禁用），
+   *  由 pm2 自动重启拉起。默认 5 分钟。 */
+  disconnectWatchdogMs: z.number().default(300000),
+  /** v0.1.3：出站分块发送之间的全局节流间隔（ms），借鉴 Hermes 主动频控思路；0 = 不节流。 */
+  interMessageDelayMs: z.number().default(300),
+  /** v0.1.3：入站消息去重窗口（ms），同一消息 id 在该窗口内重复推送只处理一次；0 = 禁用。 */
+  dedupWindowMs: z.number().default(300000),
+  /** v0.1.3：空闲会话内存项 TTL（ms），超过该时长未活跃则从内存清理（磁盘历史保留）；0 = 禁用。 */
+  sessionTtlMs: z.number().default(0),
 })
 
 export function apply(ctx, config) {
@@ -117,7 +126,25 @@ export function apply(ctx, config) {
   // ⚠️ 不在此处捕获 credentials 服务：loader 并发挂载插件，凭据服务可能晚于本插件
   //    激活；ctx.get('credentials') 必须在每次使用时现取。
 
-  // —— 入站管线：事件 → 标准消息 → acl → slash → agent ——
+  // —— 入站管线：事件 → 标准消息 → 去重 → acl → slash → agent ——
+  // v0.1.3：入站消息去重（借鉴 Hermes DEDUP_WINDOW_SECONDS），防 QQ 重复推送导致
+  // 重复入队/重复触发 agent 回合。按消息 id 记录时间戳，窗口内重复即丢弃。
+  const dedupSeen = new Map() // messageId → ts
+  const isDuplicate = (messageId) => {
+    const win = cfg.dedupWindowMs
+    if (!win || win <= 0 || !messageId) return false
+    const now = Date.now()
+    const prev = dedupSeen.get(messageId)
+    dedupSeen.set(messageId, now)
+    // 周期性清理过期记录（防 Map 无界增长）
+    if (dedupSeen.size > 2000) {
+      for (const [id, ts] of dedupSeen) {
+        if (now - ts > win) dedupSeen.delete(id)
+      }
+    }
+    return prev !== undefined && now - prev < win
+  }
+
   const onEvent = async (dispatch) => {
     try {
       const routed = routeEvent(dispatch)
@@ -136,6 +163,11 @@ export function apply(ctx, config) {
       }
 
       const { message } = routed
+      // v0.1.3：消息去重（重复推送直接丢弃，不计入频控、不触发 agent）
+      if (isDuplicate(message.id)) {
+        log.debug(`丢弃重复消息 id=${message.id}`)
+        return
+      }
       log.info(`入站 ${message.chat.kind}(${message.chat.id}): ${message.content?.[0]?.text?.slice(0, 60) || ''}`)
 
       // 白名单 fail-closed
@@ -217,6 +249,7 @@ export function apply(ctx, config) {
     try {
       bot.qqapi?.stop()
     } catch { /* ignore */ }
+    log.event('bot_stopped', { appId: bot.appId })
     bot = null
     qqapi = null
   }
@@ -261,12 +294,13 @@ export function apply(ctx, config) {
         }
       }
       const api = new QQApi({ id, secret, sandbox: cfg.sandbox, logger: log, timer: ctx.timer })
-      const transport = new QQWebSocketTransport({ qqapi: api, logger: log, timer: ctx.timer, onEvent })
+      const transport = new QQWebSocketTransport({ qqapi: api, logger: log, timer: ctx.timer, onEvent, watchdogMs: cfg.disconnectWatchdogMs })
       bot = { qqapi: api, transport, appId: id, credKey }
       qqapi = api
       if (cfg.transport === 'websocket') {
         transport.start().catch((err) => log.error('transport 启动失败:', err?.message))
         log.info(`机器人已启动（${reason}）：AppID=${id} transport=websocket`)
+        log.event('bot_started', { appId: id, reason })
       } else {
         log.warn(`transport=${cfg.transport} 尚未实现（P5 预留），当前仅支持 websocket；机器人未连接，请改为 'websocket'`)
       }
@@ -287,9 +321,31 @@ export function apply(ctx, config) {
     ensureBot('凭据已更新').catch((err) => log.error('凭据更新后启动机器人失败:', err?.message))
   })
 
-  // —— 卸载清理（WS 连接 + token 刷新定时器随插件生命周期回收）——
+  // —— v0.1.3：空闲会话/频控记录 TTL 清理（原生 setInterval，防内存无界增长）——
+  let ttlTimer = null
+  const startTtlCleanup = () => {
+    if (!cfg.sessionTtlMs || cfg.sessionTtlMs <= 0) return
+    ttlTimer = setInterval(() => {
+      try {
+        sessionMap.pruneIdle(cfg.sessionTtlMs)
+        outbound.pruneIdle(cfg.sessionTtlMs)
+        acl.prune()
+      } catch (err) {
+        log.error('TTL 清理异常:', err?.message)
+      }
+    }, 600_000) // 每 10 分钟检查一次
+    ttlTimer.unref?.()
+    log.info(`[ttl] 空闲会话清理已启用：TTL=${Math.round(cfg.sessionTtlMs / 86400000)}d，每 10 分钟检查`)
+  }
+  startTtlCleanup()
+
+  // —— 卸载清理（WS 连接 + token 刷新定时器 + TTL 定时器随插件生命周期回收）——
   ctx.effect(() => () => {
     stopBot()
+    if (ttlTimer) {
+      clearInterval(ttlTimer)
+      ttlTimer = null
+    }
   })
 }
 

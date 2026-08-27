@@ -10,7 +10,14 @@
  *   - 频控错误码 50015014「系统繁忙」= 平台频控：指数退避重试（5s → 10s → 20s → 上限 60s）
  *   - 11255（私域机器人 / 沙箱外人员）= 永久性错误，不重试，仅记录
  *
- * 运行环境：Node 22（全局 fetch）。token 刷新定时器用 ctx.timer（卸载自动清理）。
+ * v0.1.3（借鉴 Hermes gateway/platforms/qqbot/adapter.py）：
+ *   - token 刷新去重：并发请求共享同一个 in-flight 刷新 promise（Hermes asyncio.Lock + 双检）
+ *   - token 刷新改原生 setInterval（脱离 ctx.timer，与传输层一致，免疫 timer 服务异常）
+ *   - 发送通用重试：网络错误/5xx → 指数退避重试（1s→2s→4s，最多 3 次）；
+ *     永久错误（400 + 已知永久 code 列表）不重试
+ *   - invalidateToken()：强制下次刷新（4004 关闭码触发）；clearGateway()：网关地址失效重取
+ *
+ * 运行环境：Node 22（全局 fetch）。定时器均为原生实现（stop() 统一清理）。
  */
 
 const TOKEN_URL = 'https://bots.qq.com/app/getAppAccessToken'
@@ -36,6 +43,13 @@ async function fetchWithTimeout(url, init = {}) {
 /** 频控退避：重试次数 → 等待毫秒。 */
 const RATE_LIMIT_BACKOFF = [5_000, 10_000, 20_000, 30_000, 60_000]
 
+/** v0.1.3：通用瞬时错误重试退避（网络错误 / 5xx）。 */
+const TRANSIENT_RETRY_BACKOFF = [1_000, 2_000, 4_000]
+const TRANSIENT_MAX_ATTEMPTS = 3
+
+/** 永久错误码：命中则不重试（借鉴 Hermes "invalid/forbidden/not found/bad request" 不重试策略）。 */
+const PERMANENT_CODES = new Set([11255, 40034127])
+
 export class QQApi {
   /**
    * @param {object} opts
@@ -43,7 +57,7 @@ export class QQApi {
    * @param {string} opts.secret      AppSecret（明文或 secretEnv 解析后）
    * @param {boolean} opts.sandbox    沙箱 / 正式
    * @param {object} opts.logger      makeLogger 产物
-   * @param {object} opts.timer       ctx.timer（timeout/interval 返回 disposer）
+   * @param {object} opts.timer       ctx.timer（v0.1.3 起不再用于定时器，仅保留兼容）
    */
   constructor({ id, secret, sandbox, logger, timer }) {
     this.appId = id
@@ -61,7 +75,9 @@ export class QQApi {
       : 'https://api.sgroup.qq.com'
 
     this.seqCounter = 0 // msg_seq 自增（防重放）
-    this._refreshDisposer = null
+    this._refreshTimer = null // 原生 setInterval 句柄
+    this._refreshing = null // in-flight token 刷新 promise（去重）
+    this._tokenInvalidated = false // 收到 4004 后强制刷新一次
     this._stopped = false
   }
 
@@ -71,36 +87,62 @@ export class QQApi {
     return this.seqCounter
   }
 
-  /** 启动 token 定时刷新循环（幂等；stop() 后不再刷新）。 */
+  /** 启动 token 定时刷新循环（幂等；stop() 后不再刷新）。v0.1.3：原生 setInterval，脱离 ctx.timer。 */
   startTokenRefresh() {
-    if (this._refreshDisposer) return
-    this._refreshDisposer = this.timer.interval(() => {
+    if (this._refreshTimer || this._stopped) return
+    this._refreshTimer = setInterval(() => {
       if (this._stopped) return
-      if (Date.now() + TOKEN_TTL_MARGIN_MS >= this.tokenExpiresAt) {
+      if (this._tokenInvalidated || Date.now() + TOKEN_TTL_MARGIN_MS >= this.tokenExpiresAt) {
+        this._tokenInvalidated = false
         this.refreshToken().catch((err) => this.log.error('token 刷新失败', err?.message))
       }
     }, REFRESH_CHECK_MS)
+    this._refreshTimer.unref?.()
   }
 
   stop() {
     this._stopped = true
-    this._refreshDisposer?.()
-    this._refreshDisposer = null
+    if (this._refreshTimer) {
+      clearInterval(this._refreshTimer)
+      this._refreshTimer = null
+    }
+  }
+
+  /** token 失效（4004 关闭码）→ 标记强制刷新一次。 */
+  invalidateToken() {
+    this._tokenInvalidated = true
+    this.token = null
+    this.tokenExpiresAt = 0
+  }
+
+  /** 网关地址失效（连续重连失败）→ 清缓存，下次重取。 */
+  clearGateway() {
+    this.gatewayUrl = null
   }
 
   /**
    * 获取（或缓存）access_token。
    * 首次调用强制拉取；之后若未过期直接返回缓存。
+   * v0.1.3：并发调用共享同一个 in-flight 刷新 promise（去重，防同时刷新）。
    */
   async getAccessToken(force = false) {
-    if (!force && this.token && Date.now() + TOKEN_TTL_MARGIN_MS < this.tokenExpiresAt) {
+    if (!force && !this._tokenInvalidated && this.token && Date.now() + TOKEN_TTL_MARGIN_MS < this.tokenExpiresAt) {
       return this.token
     }
     return this.refreshToken()
   }
 
-  /** POST getAppAccessToken，更新内存 token。 */
+  /** POST getAppAccessToken，更新内存 token。并发去重：同一时刻只有一个刷新在飞。 */
   async refreshToken() {
+    if (this._refreshing) return this._refreshing
+    this._refreshing = this._doRefreshToken()
+      .finally(() => {
+        this._refreshing = null
+      })
+    return this._refreshing
+  }
+
+  async _doRefreshToken() {
     const res = await fetchWithTimeout(TOKEN_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -115,11 +157,12 @@ export class QQApi {
     }
     this.token = data.access_token
     this.tokenExpiresAt = Date.now() + (Number(data.expires_in) || 7200) * 1000
+    this._tokenInvalidated = false
     this.log.debug('token 已刷新，有效期', Math.round((this.tokenExpiresAt - Date.now()) / 1000), 's')
     return this.token
   }
 
-  /** GET {endpoint}/gateway，取 WS 网关地址（缓存）。 */
+  /** GET {endpoint}/gateway，取 WS 网关地址（缓存；clearGateway() 后可重取）。 */
   async getGateway() {
     if (this.gatewayUrl) return this.gatewayUrl
     const token = await this.getAccessToken()
@@ -160,7 +203,6 @@ export class QQApi {
       // ⚠️ msg_type 按会话类型区分（官方文档实锤）：
       //   v2 单聊/群聊：0 = 纯文本（content），2 = Markdown（需模板权限）
       //   频道（旧 guild 接口 /channels/{id}/messages）：1 = 文本
-      //   旧实现写死 1，导致 C2C/群发消息报 40034127「无markdown模板权限」
       msg_type: chat.kind === 'channel' ? 1 : 0,
       msg_seq: this.nextSeq(),
     }
@@ -201,42 +243,56 @@ export class QQApi {
   }
 
   /**
-   * POST 统一带退避重试：
-   *   - 401/403 → 刷新 token 后重试一次
-   *   - 50015014（频控）→ 指数退避重试
-   *   - 11255（私域/沙箱外人员）→ 永久错误，不重试
-   *   - 其余 → 记录日志不重试
+   * POST 统一带退避重试（v0.1.3 增强）：
+   *   - 网络错误 / 5xx          → 指数退避重试（1s→2s→4s，最多 3 次）
+   *   - 401/403                → 刷新 token 后重试一次
+   *   - 50015014（频控）        → 指数退避重试（5s→60s）
+   *   - 永久错误（11255 等）     → 不重试
+   *   - 其余                    → 记录日志不重试
    */
   async postWithRetry(url, token, body, chat) {
-    const attempt = async (authToken, isRetry) => {
-      const res = await fetchWithTimeout(url, {
-        method: 'POST',
-        headers: {
-          Authorization: `QQBot ${authToken}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(body),
-      })
-      if (res.ok) {
-        return res.json().catch(() => null)
-      }
-      const text = await res.text().catch(() => '')
-      let code = null
+    const attempt = async (authToken) => {
       try {
-        code = JSON.parse(text).code ?? null
-      } catch {
-        /* 非 JSON 响应 */
+        const res = await fetchWithTimeout(url, {
+          method: 'POST',
+          headers: {
+            Authorization: `QQBot ${authToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(body),
+        })
+        if (res.ok) {
+          return res.json().catch(() => null)
+        }
+        const text = await res.text().catch(() => '')
+        let code = null
+        try {
+          code = JSON.parse(text).code ?? null
+        } catch {
+          /* 非 JSON 响应 */
+        }
+        return { _status: res.status, _code: code, _text: text.slice(0, 300) }
+      } catch (err) {
+        // 网络层错误（超时/断网等）→ 标记为瞬时错误，由重试逻辑处理
+        return { _status: 0, _code: null, _text: `network: ${err?.message || err}` }
       }
-      return { _status: res.status, _code: code, _text: text.slice(0, 300) }
     }
 
-    let result = await attempt(token, false)
+    const isTransientHttp = (r) =>
+      r && typeof r === 'object' && '_status' in r && r._status === 0 // 网络错误
+    const is5xx = (r) => r && typeof r === 'object' && '_status' in r && r._status >= 500 && r._status <= 599
+    const isPermanent = (r) =>
+      r && typeof r === 'object' && '_code' in r && r._code !== null && PERMANENT_CODES.has(Number(r._code))
+
+    let result = await attempt(token)
+
     // token 失效：刷新后重试一次
     if (result && typeof result === 'object' && '_status' in result && [401, 403].includes(result._status)) {
       this.log.warn('token 失效，刷新后重试')
       const fresh = await this.refreshToken().catch(() => null)
-      if (fresh) result = await attempt(fresh, true)
+      if (fresh) result = await attempt(fresh)
     }
+
     // 频控 50015014：指数退避重试
     let backoffIndex = 0
     while (
@@ -247,17 +303,38 @@ export class QQApi {
       this.log.warn(`平台频控 50015014，${wait / 1000}s 后重试 (${backoffIndex + 1}/${RATE_LIMIT_BACKOFF.length})`)
       await sleep(wait)
       const freshToken = await this.getAccessToken().catch(() => token)
-      result = await attempt(freshToken, true)
+      result = await attempt(freshToken)
       backoffIndex += 1
+    }
+
+    // v0.1.3：网络错误 / 5xx → 通用指数退避重试（最多 3 次）
+    if (!result || typeof result !== 'object' || !('_status' in result)) {
+      return result // 成功或已解析的响应
+    }
+    if (isPermanent(result)) {
+      const { _code, _text } = result
+      this.log.error(`发送失败 code=${_code}（永久性错误，不重试）: ${_text}`)
+      return null
+    }
+    if (isTransientHttp(result) || is5xx(result)) {
+      for (let i = 0; i < TRANSIENT_MAX_ATTEMPTS - 1; i += 1) {
+        const wait = TRANSIENT_RETRY_BACKOFF[i] ?? 4_000
+        this.log.warn(`发送瞬时失败（${result._status === 0 ? result._text : `HTTP ${result._status}`}），${wait / 1000}s 后重试 (${i + 2}/${TRANSIENT_MAX_ATTEMPTS})`)
+        await sleep(wait)
+        const freshToken = await this.getAccessToken().catch(() => token)
+        result = await attempt(freshToken)
+        if (!result || typeof result !== 'object' || !('_status' in result)) return result
+        if (isPermanent(result)) {
+          this.log.error(`发送失败 code=${result._code}（永久性错误，不重试）: ${result._text}`)
+          return null
+        }
+        if (!(isTransientHttp(result) || is5xx(result))) break
+      }
     }
 
     if (result && typeof result === 'object' && '_status' in result) {
       const { _status, _code, _text } = result
-      if (_code === 11255) {
-        this.log.error(`发送失败 code=11255（永久性错误：私域机器人或发送者不在沙箱/测试人员名单）: ${_text}`)
-      } else {
-        this.log.error(`发送失败 HTTP ${_status} code=${_code}: ${_text}`)
-      }
+      this.log.error(`发送失败 HTTP ${_status} code=${_code}: ${_text}`)
       return null
     }
     this.log.debug('发送成功 →', chat.kind, chat.id, 'seq', body.msg_seq)

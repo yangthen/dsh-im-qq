@@ -55,4 +55,21 @@ export class Acl {
     this.rateHits.set(chatKey, hits)
     return { ok: true }
   }
+
+  /** 清理过期频控记录（v0.1.3：防 rateHits 无界增长；空闲 chatKey 的内存项移除）。 */
+  prune() {
+    const now = Date.now()
+    let removed = 0
+    for (const [key, hits] of this.rateHits) {
+      const live = hits.filter((t) => now - t < RATE_LIMIT_WINDOW_MS)
+      if (live.length === 0) {
+        this.rateHits.delete(key)
+        removed += 1
+      } else {
+        this.rateHits.set(key, live)
+      }
+    }
+    if (removed > 0) this.log.debug(`acl 清理 ${removed} 个空闲频控记录`)
+    return removed
+  }
 }
