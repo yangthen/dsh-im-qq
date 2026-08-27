@@ -1,5 +1,29 @@
 # dsh-im-qq
 
+> ## 📌 本仓库说明（Fork）
+>
+> 本仓库 fork 自 **[988hj7tczd-oss/dsh-im-qq](https://github.com/988hj7tczd-oss/dsh-im-qq)**（原仓库），用于长期维护与迭代，不向上游同步。
+>
+> ### 主要改动与优化（v0.1.3，2026-08-27）
+>
+> 在原版（v0.1.1）基础上，借鉴开源 [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) 的 QQ Bot 网关实现，完成健壮性迭代与代码审计修复：
+>
+> **健壮性迭代**
+> - 关闭码分类处理：4004 → 刷新 token 重连；4006/4007/4009 → 清 session 全新 identify；4008 → 退避 60s；**4914/4915（下线/封禁）→ 停止重连**（避免无限重连与 PM2 重启循环）
+> - 快速断连检测（<5s 连续 3 次 → 判定配置/权限问题，停止重连）+ 重连次数上限（100 次）+ 连续失败强制重取 gateway
+> - token 刷新去重锁（并发共享同一 in-flight 刷新）+ 原生定时器（脱离 `ctx.timer`，免疫 timer 服务异常）
+> - 发送通用重试（网络错误/5xx 指数退避，永久错误不重试）+ 全局发送节流（`interMessageDelayMs`）+ 入站消息去重（`dedupWindowMs`）
+> - 空闲会话 TTL 清理（`sessionTtlMs`）+ ACL 频控记录清理
+> - 结构化事件日志（`log.event`：`ws_ready` / `ws_fatal` / `watchdog_exit` 等 JSON 行，便于排障）
+>
+> **代码审计修复**
+> - 修复高危 Bug：重连定时器句柄误当函数调用（`reconnectTimer?.()` 对 `setTimeout` 句柄抛 `TypeError`，可致进程崩溃）
+> - 审批超时 / 出站 flush 定时器全部脱离 `ctx.timer`（timer 服务异常时不再出现审批挂起、回复不发送的静默故障）
+> - ACL 白名单默认改为 fail-closed（`allowFrom` / `groupAllowFrom` 默认 `[]`，不配置即全拒）
+> - 空闲会话清理只释放 agent 句柄、保留映射（避免 sessionId 冲突与历史错乱）
+>
+> 冒烟测试 `scripts/smoke-test.mjs` 108 项全通过。
+
 ![CI](https://github.com/988hj7tczd-oss/dsh-im-qq/actions/workflows/smoke.yml/badge.svg)
 
 让 **DeepSeek Harness** 接入 **QQ 官方机器人**（q.qq.com）——通过 QQ（私聊 / 群聊 / 频道 @）直接与 harness 的完整 agent 对话：工具调用、记忆、子代理、文件系统与安全护栏，**与 Web UI 完全同源**。
