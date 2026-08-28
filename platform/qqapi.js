@@ -59,12 +59,15 @@ export class QQApi {
    * @param {object} opts.logger      makeLogger 产物
    * @param {object} opts.timer       ctx.timer（v0.1.3 起不再用于定时器，仅保留兼容）
    */
-  constructor({ id, secret, sandbox, logger, timer }) {
+  constructor({ id, secret, sandbox, logger, timer, markdown }) {
     this.appId = id
     this.secret = secret
     this.sandbox = !!sandbox
     this.log = logger
     this.timer = timer
+    // v0.1.4: 是否启用 QQ Markdown 消息（msg_type=2, 客户端原生渲染表格等）。
+    // 默认 false（需平台开通 markdown 权限）；开启后若无权限自动回退纯文本。
+    this.markdown = !!markdown
 
     this.token = null // access_token（仅内存）
     this.tokenExpiresAt = 0 // epoch ms
@@ -187,8 +190,8 @@ export class QQApi {
    * @param {Array<{type: 'text'|'image'|'file', text?: string}>} payload.blocks 出站块（当前只发 text）
    * @param {boolean} [payload.passive] 是否被动回复（带 msg_id，限 replyPassiveLimit 次/消息）
    * @param {string} [payload.msgId]    被动回复时携带的入站消息 id
-   * @param {object} [payload.keyboard] 消息内嵌按钮（审批桥用）
-   * @returns {Promise<object|null>} 平台返回体（发失败且重试耗尽返回 null，不抛出——出站不致命）
+   * @param {object} [payload.keyboard] 消息内嵌按钮（审批桥用；含键盘时强制纯文本，QQ 不允许 markdown+键盘混用）
+   * @returns {Promise<object|null>} 平台返回体（发失败且重试耗尽返回失败信息对象，不抛出——出站不致命）
    */
   async sendMessage(chat, { blocks = [], passive = false, msgId, keyboard } = {}) {
     const text = blocks
@@ -198,20 +201,39 @@ export class QQApi {
       .trim()
     if (!text) return null
 
-    const body = {
-      content: text,
-      // ⚠️ msg_type 按会话类型区分（官方文档实锤）：
-      //   v2 单聊/群聊：0 = 纯文本（content），2 = Markdown（需模板权限）
-      //   频道（旧 guild 接口 /channels/{id}/messages）：1 = 文本
-      msg_type: chat.kind === 'channel' ? 1 : 0,
-      msg_seq: this.nextSeq(),
-    }
-    if (passive && msgId) body.msg_id = msgId
-    if (keyboard) body.keyboard = keyboard
-
     const url = this.messageUrl(chat)
     const token = await this.getAccessToken()
-    return this.postWithRetry(url, token, body, chat)
+    const base = { msg_seq: this.nextSeq() }
+    if (passive && msgId) base.msg_id = msgId
+    if (keyboard) base.keyboard = keyboard
+
+    const isChannel = chat.kind === 'channel'
+    // v0.1.4: 启用 markdown（非频道 + 无键盘 + 配置开启）→ msg_type=2 + markdown.content
+    //   ⚠️ msg_type 官方实锤：v2 单聊/群聊 0=纯文本 2=Markdown(需模板权限)；
+    //      频道(旧 guild 接口)固定 1=文本；含键盘时只能纯文本。
+    const useMarkdown = this.markdown && !isChannel && !keyboard
+    const buildBody = (md) => {
+      const body = { ...base }
+      if (isChannel) {
+        body.msg_type = 1
+        body.content = text
+      } else if (md) {
+        body.msg_type = 2
+        body.markdown = { content: text }
+      } else {
+        body.msg_type = 0
+        body.content = text
+      }
+      return body
+    }
+
+    let result = await this.postWithRetry(url, token, buildBody(useMarkdown), chat)
+    // markdown 权限未开通（40034127）→ 自动回退纯文本重发一次（借鉴 Hermes markdown_support 降级思路）
+    if (useMarkdown && result && typeof result === 'object' && result._code === 40034127) {
+      this.log.warn('markdown 权限未开通（40034127），回退纯文本发送')
+      result = await this.postWithRetry(url, token, buildBody(false), chat)
+    }
+    return result
   }
 
   /** 按会话类型拼消息 URL（三处 POST 均必带 msg_seq，已在 body 里）。 */
@@ -314,7 +336,7 @@ export class QQApi {
     if (isPermanent(result)) {
       const { _code, _text } = result
       this.log.error(`发送失败 code=${_code}（永久性错误，不重试）: ${_text}`)
-      return null
+      return result // 返回失败信息供调用方降级处理（如 markdown 权限回退）
     }
     if (isTransientHttp(result) || is5xx(result)) {
       for (let i = 0; i < TRANSIENT_MAX_ATTEMPTS - 1; i += 1) {
@@ -326,7 +348,7 @@ export class QQApi {
         if (!result || typeof result !== 'object' || !('_status' in result)) return result
         if (isPermanent(result)) {
           this.log.error(`发送失败 code=${result._code}（永久性错误，不重试）: ${result._text}`)
-          return null
+          return result
         }
         if (!(isTransientHttp(result) || is5xx(result))) break
       }
@@ -335,7 +357,7 @@ export class QQApi {
     if (result && typeof result === 'object' && '_status' in result) {
       const { _status, _code, _text } = result
       this.log.error(`发送失败 HTTP ${_status} code=${_code}: ${_text}`)
-      return null
+      return result
     }
     this.log.debug('发送成功 →', chat.kind, chat.id, 'seq', body.msg_seq)
     return result

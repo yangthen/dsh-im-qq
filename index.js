@@ -72,7 +72,7 @@ export const Config = z.object({
   workspaceIsolation: z.boolean().default(true),
   allowFrom: z.array(z.string()).default([]), // 空=全拒（fail-closed）；显式配 '*' 才放行
   groupAllowFrom: z.array(z.string()).default([]),
-  markdown: z.boolean().default(false), // msg_type 2，需平台开通权限
+  markdown: z.boolean().default(true), // v0.1.4: QQ Markdown 消息(msg_type=2, 客户端渲染表格等); 默认开, 无权限(40034127)自动回退纯文本
   typing: z.boolean().default(true), // P4 实测确认接口后实现
   streaming: z.boolean().default(false), // P4 实测确认接口后实现
   streamThrottleMs: z.number().default(1200),
@@ -293,7 +293,7 @@ export function apply(ctx, config) {
           return
         }
       }
-      const api = new QQApi({ id, secret, sandbox: cfg.sandbox, logger: log, timer: ctx.timer })
+      const api = new QQApi({ id, secret, sandbox: cfg.sandbox, logger: log, timer: ctx.timer, markdown: cfg.markdown })
       const transport = new QQWebSocketTransport({ qqapi: api, logger: log, timer: ctx.timer, onEvent, watchdogMs: cfg.disconnectWatchdogMs })
       bot = { qqapi: api, transport, appId: id, credKey }
       qqapi = api

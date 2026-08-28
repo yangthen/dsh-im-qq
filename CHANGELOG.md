@@ -2,6 +2,15 @@
 
 所有重要变更记录（格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)）。
 
+## [0.1.4] - 2026-08-28
+
+### Added
+
+- **QQ Markdown 消息支持**（借鉴 Hermes `markdown_support`）：配置 `markdown`（默认 true）开启后，C2C/群聊发送 `msg_type: 2` + `markdown.content`，QQ 客户端原生渲染表格/标题/加粗等。
+- **markdown 权限缺失自动回退**：收到 40034127（无 markdown 模板权限）时自动降级为纯文本（`msg_type: 0`）重发，不影响可用性。
+- 键盘消息（审批按钮）强制纯文本（QQ 不允许 markdown+键盘混用）；频道消息保持 `msg_type: 1`。
+- 冒烟测试新增 6 个用例（markdown 消息体 / 纯文本 / 键盘强制文本 / 40034127 回退），共 114 项全通过。
+
 ## [0.1.3] - 2026-08-27
 
 ### Added

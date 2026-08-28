@@ -145,6 +145,71 @@ console.log('== 4. qqapi URL / seq（无网络） ==')
   ok('正式端点', api2.endpoint === 'https://api.sgroup.qq.com')
 }
 
+// == 4b. v0.1.4 markdown 消息体与 40034127 回退（mock fetch） ==
+{
+  const logger2 = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {}, event: () => {} }
+  const mkApi = (markdown) =>
+    new QQApi({ id: '1', secret: 's', sandbox: true, logger: logger2, timer: { timeout: () => () => {}, interval: () => () => {} }, markdown })
+  const captured = []
+
+  // 记录每次 POST 的请求体（token 请求返回有效 token，发消息请求返回成功）
+  const mockFetch = async (url, init) => {
+    if (String(url).includes('getAppAccessToken')) {
+      return { ok: true, status: 200, json: async () => ({ access_token: 'tok', expires_in: 7200 }), text: async () => '' }
+    }
+    captured.push(JSON.parse(init.body))
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ id: 'x' }),
+      text: async () => '',
+    }
+  }
+
+  // 1) markdown=true → msg_type=2 + markdown.content
+  const apiMd = mkApi(true)
+  const origFetch = globalThis.fetch
+  globalThis.fetch = mockFetch
+  try {
+    await apiMd.sendMessage({ kind: 'user', id: 'o1' }, { blocks: [{ type: 'text', text: '# 标题\n| a | b |\n|---|---|\n| 1 | 2 |' }] })
+    const body = captured.pop()
+    ok('markdown: msg_type=2', body.msg_type === 2)
+    ok('markdown: 含 markdown.content', body.markdown && body.markdown.content.includes('| a | b |'))
+
+    // 2) markdown=false → msg_type=0 + content
+    captured.length = 0
+    const apiTxt = mkApi(false)
+    await apiTxt.sendMessage({ kind: 'user', id: 'o1' }, { blocks: [{ type: 'text', text: '普通文本' }] })
+    const bodyTxt = captured.pop()
+    ok('纯文本: msg_type=0', bodyTxt.msg_type === 0)
+    ok('纯文本: 用 content 字段', bodyTxt.content === '普通文本' && !bodyTxt.markdown)
+
+    // 3) 键盘消息强制纯文本（审批按钮）
+    captured.length = 0
+    await apiMd.sendMessage({ kind: 'user', id: 'o1' }, { blocks: [{ type: 'text', text: '审批' }], keyboard: { content: {} } })
+    const bodyKb = captured.pop()
+    ok('含键盘: 强制 msg_type=0', bodyKb.msg_type === 0)
+
+    // 4) markdown 权限缺失(40034127) → 自动回退纯文本重发
+    let calls = 0
+    globalThis.fetch = async (url, init) => {
+      if (String(url).includes('getAppAccessToken')) {
+        return { ok: true, status: 200, json: async () => ({ access_token: 'tok', expires_in: 7200 }), text: async () => '' }
+      }
+      calls += 1
+      if (calls === 1) return { ok: false, status: 400, text: async () => JSON.stringify({ code: 40034127 }) }
+      captured.push(JSON.parse(init.body))
+      return { ok: true, status: 200, json: async () => ({ id: 'y' }), text: async () => '' }
+    }
+    captured.length = 0
+    await apiMd.sendMessage({ kind: 'group', id: 'g1' }, { blocks: [{ type: 'text', text: '表格内容' }] })
+    const fallbackBody = captured.pop()
+    ok('40034127 回退: 重发 msg_type=0', calls === 2 && fallbackBody.msg_type === 0 && fallbackBody.content === '表格内容')
+  } finally {
+    globalThis.fetch = origFetch
+  }
+}
+
 console.log('== 5. session-map 生命周期（mock dsh） ==')
 {
   const tmp = mkdtempSync(join(tmpdir(), 'qq-smoke-'))
