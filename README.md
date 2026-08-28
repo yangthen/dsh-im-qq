@@ -23,6 +23,12 @@
 > - 空闲会话清理只释放 agent 句柄、保留映射（避免 sessionId 冲突与历史错乱）
 >
 > 冒烟测试 `scripts/smoke-test.mjs` 108 项全通过。
+>
+> ### v0.1.5（2026-08-28）—— QQ 专用上下文压缩（带宽优化）
+>
+> - **QQ 会话改挂内置 `qq` agent preset**（`presets/qq/`，standard 的副本）：compaction 阈值 0.8→0.3、保留 0.16→0.1，每次 LLM 调用上传的上下文从 ~160K-800K token 收敛到 ~100K-300K（约 2.5x 下降），解决低带宽服务器（~1-2Mbps）在活跃会话时的带宽告警。
+> - **只影响 QQ 会话**：原生 dsh/dst、dsh-web、dsh-tui 仍用框架自带 standard preset，行为不变。
+> - **preset 自动安装**：`presetAutoInstall`（默认 true）启动时把 `presets/qq/` 同步到 `$DSH_HOME/.agent-presets/qq/`（幂等，安装后只读防回写）；`agentPreset` 默认值改为 `qq`，开箱即用，无需手工部署。
 
 ![CI](https://github.com/988hj7tczd-oss/dsh-im-qq/actions/workflows/smoke.yml/badge.svg)
 
@@ -38,7 +44,7 @@
 | 私聊（C2C）文本收发 | ✅ 已实现 |
 | 群聊 @机器人 / 频道 @机器人 | ✅ 已实现 |
 | 会话隔离（每人/每群独立 session，`qq:` 前缀） | ✅ 已实现 |
-| 完整 agent 能力（工具/记忆/子代理/文件系统） | ✅ 经 `agentPresets.mount` 挂 standard preset |
+| 完整 agent 能力（工具/记忆/子代理/文件系统） | ✅ 经 `agentPresets.mount` 挂内置 qq preset（standard 同源，v0.1.5 起） |
 | WS 长连接（心跳 / 断线重连 / RESUME / op9 重 identify） | ✅ 已实现 |
 | 回复合并 / 超长分段 / 去内部标签 / 错误兜底 | ✅ 已实现 |
 | 白名单 fail-closed + 频控 | ✅ 已实现 |
@@ -96,7 +102,9 @@ export DSH_QQ_SECRET='你的AppSecret'
         transport: 'websocket'     # websocket（当前）| webhook（P5）
         provider: 'deepseek-official'
         model: 'deepseek-v4-flash'
-        agentPreset: 'standard'    # standard / code / minimal / cordis / 自定义
+        agentPreset: 'qq'          # v0.1.5: 默认内置 qq preset（提前压缩上下文）；
+                                   #   standard / code / minimal / cordis / 自定义
+        presetAutoInstall: true    # 自动同步 presets/qq/ 到 $DSH_HOME/.agent-presets/qq/
         cwd: '~/qq-workspace'      # 独立工作区（自动创建）
         workspaceIsolation: true   # 每会话 <cwd>/<chatKey>/ 子目录
         allowFrom: ['*']           # 私聊白名单：空=全拒（fail-closed）

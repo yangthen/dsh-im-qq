@@ -1,0 +1,3 @@
+name: QQ 标准（提前压缩）
+description: 标准 preset 的 QQ 专用副本：上下文压缩阈值 0.8→0.3、保留 0.16→0.1，降低每次 LLM 调用上传体积（带宽优化）。仅 QQ 会话使用，原生 dsh/dst 不受影响。
+order: 2

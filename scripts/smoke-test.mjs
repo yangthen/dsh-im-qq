@@ -7,7 +7,7 @@
  *       session-map 生命周期 / outbound 合并与兜底 / approval 按钮回调解析
  */
 import assert from 'node:assert'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, existsSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -66,6 +66,39 @@ console.log('== 1. router 事件路由 ==')
   const inter4 = routeEvent({ t: 'INTERACTION_CREATE', d: { id: 'i4', type: 11, group_member_openid: 'M1', data: { resolved: { button_id: 'x:reject' } } } })
   ok('群聊点击者从 group_member_openid 取', inter4.interaction.clicker === 'M1')
   ok('未知事件忽略', routeEvent({ t: 'GUILD_MEMBER_ADD', d: {} }) === null)
+}
+
+console.log('== 1b. preset 自安装（core/preset-install.js） ==')
+{
+  const fakeHome = mkdtempSync(join(tmpdir(), 'qq-preset-'))
+  const prevHome = process.env.DSH_HOME
+  process.env.DSH_HOME = fakeHome
+  const { installBundledPreset, BUNDLED_PRESET_DIR } = await import('../core/preset-install.js')
+  const quiet = { info: () => {}, error: () => {} }
+  try {
+    const target = installBundledPreset({}, quiet)
+    ok('安装目录 = $DSH_HOME/.agent-presets/qq', target === join(fakeHome, '.agent-presets', 'qq'))
+    const f1 = join(target, 'agent.cordis.yml')
+    const f2 = join(target, 'preset.yml')
+    ok('agent.cordis.yml 已安装', existsSync(f1))
+    ok('preset.yml 已安装', existsSync(f2))
+    ok('内容与仓库 presets/qq 一致', readFileSync(f1).equals(readFileSync(join(BUNDLED_PRESET_DIR, 'agent.cordis.yml'))))
+    ok('mode 0444 只读（防 loader 回写）', (statSync(f1).mode & 0o444) === 0o444)
+    const mtime1 = statSync(f1).mtimeMs
+    installBundledPreset({}, quiet)
+    ok('幂等（内容未变不重写）', statSync(f1).mtimeMs === mtime1)
+    writeFileSync(f1, 'garbage')
+    installBundledPreset({}, quiet)
+    ok('目标被篡改后重新同步', readFileSync(f1).equals(readFileSync(join(BUNDLED_PRESET_DIR, 'agent.cordis.yml'))))
+    const other = mkdtempSync(join(tmpdir(), 'qq-preset-root-'))
+    installBundledPreset({ agentPresets: { roots: [{ path: other, trust: 'user' }] } }, quiet)
+    ok('agentPresets.roots 的 user 根优先', existsSync(join(other, 'qq', 'agent.cordis.yml')))
+    rmSync(other, { recursive: true, force: true })
+  } finally {
+    if (prevHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = prevHome
+    rmSync(fakeHome, { recursive: true, force: true })
+  }
 }
 
 console.log('== 2. acl fail-closed ==')

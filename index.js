@@ -37,6 +37,7 @@ import { QQWebSocketTransport } from './platform/transport/websocket.js'
 import { routeEvent } from './platform/router.js'
 import { Acl } from './core/acl.js'
 import { SessionMap } from './core/session-map.js'
+import { installBundledPreset } from './core/preset-install.js'
 import { Outbound } from './core/outbound.js'
 import { ApprovalBridge } from './core/approval.js'
 import { Slash } from './core/slash.js'
@@ -67,7 +68,8 @@ export const Config = z.object({
   transport: z.string().default('websocket'), // websocket | webhook（P5 预留）
   provider: z.string().default('deepseek-official'),
   model: z.string().default('deepseek-v4-flash'),
-  agentPreset: z.string().default('standard'),
+  agentPreset: z.string().default('qq'), // v0.1.5: 默认内置 qq preset（提前压缩上下文，带宽优化）
+  presetAutoInstall: z.boolean().default(true), // v0.1.5: 启动时自动同步 presets/qq/ 到 $DSH_HOME/.agent-presets/qq/
   cwd: z.string().default('~/qq-workspace'),
   workspaceIsolation: z.boolean().default(true),
   allowFrom: z.array(z.string()).default([]), // 空=全拒（fail-closed）；显式配 '*' 才放行
@@ -203,6 +205,15 @@ export function apply(ctx, config) {
   const acl = new Acl({ allowFrom: cfg.allowFrom, groupAllowFrom: cfg.groupAllowFrom, logger: log })
   const sessionMap = new SessionMap({ ctx, config: cfg, logger: log })
   sessionMap.init(cwd)
+
+  // —— v0.1.5: 自安装内置 qq preset（fail-soft，失败只记日志，不阻断启动）——
+  if (cfg.presetAutoInstall) {
+    try {
+      installBundledPreset(ctx, log)
+    } catch (err) {
+      log.error('同步内置 qq preset 失败:', err?.message)
+    }
+  }
 
   const outbound = new Outbound({
     ctx,

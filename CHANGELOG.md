@@ -2,6 +2,18 @@
 
 所有重要变更记录（格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)）。
 
+## [0.1.5] - 2026-08-28
+
+### Added
+
+- **QQ 专用上下文压缩 preset**（解决腾讯云带宽告警根因）：QQ 会话改挂插件内置的 `qq` agent preset（`presets/qq/agent.cordis.yml`，standard 的副本），compaction 阈值从 0.8 → 0.3、保留 0.16 → 0.1（deepseek-v4-flash 上下文窗口 1M token 时，每次 LLM 调用上传体积从 ~160K-800K 收敛到 ~100K-300K，约 2.5x 下降）。**只影响 QQ 会话**：服务器上原生启动的 dsh/dst 及 dsh-web/dsh-tui 仍用框架自带 standard preset，行为不变。
+- **preset 自动安装**：配置 `presetAutoInstall`（默认 true），插件启动时把仓库内 `presets/qq/` 同步到 `$DSH_HOME/.agent-presets/qq/`（内容哈希比对，幂等；安装后 0444 防 loader 回写），会话仍走 `agentPresets.mount()` 官方通道（保留 standing mount / 子代理 composeFrom / mount 审计）。
+- `agentPreset` 默认值改为 `qq`（v0.1.5 起开箱即用，无需手工部署 preset 文件）。
+
+### Changed
+
+- 冒烟测试新增 preset 自安装用例（安装/幂等/只读/源变更重装），共 122 项。
+
 ## [0.1.4] - 2026-08-28
 
 ### Added
