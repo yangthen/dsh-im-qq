@@ -29,6 +29,7 @@
 > - **QQ 会话改挂内置 `qq` agent preset**（`presets/qq/`，standard 的副本）：compaction 阈值 0.8→0.3、保留 0.16→0.1，每次 LLM 调用上传的上下文从 ~160K-800K token 收敛到 ~100K-300K（约 2.5x 下降），解决低带宽服务器（~1-2Mbps）在活跃会话时的带宽告警。
 > - **只影响 QQ 会话**：原生 dsh/dst、dsh-web、dsh-tui 仍用框架自带 standard preset，行为不变。
 > - **preset 自动安装**：`presetAutoInstall`（默认 true）启动时把 `presets/qq/` 同步到 `$DSH_HOME/.agent-presets/qq/`（幂等，安装后只读防回写）；`agentPreset` 默认值改为 `qq`，开箱即用，无需手工部署。
+> - 冒烟测试 122 项全通过（+8 个 preset 自安装用例）。
 
 ![CI](https://github.com/988hj7tczd-oss/dsh-im-qq/actions/workflows/smoke.yml/badge.svg)
 
@@ -77,6 +78,8 @@ export DSH_QQ_SECRET='你的AppSecret'
 
 安装后 `$DSH_HOME/cordis.patch.yml` 会追加一行 `dsh-im-qq` 注册块，插件包 symlink 到 `profiles/web/node_modules/dsh-im-qq`。可 `dsh --dump-config` 验证插件行可见。
 
+> v0.1.5：插件启动时还会把内置 `qq` agent preset（`presets/qq/`）自动同步到 `$DSH_HOME/.agent-presets/qq/`（幂等、只读），无需手工部署 preset 文件。
+
 ## 配置方式
 
 ### 方式A（推荐）：桌面端「设置 → 插件 → QQ 机器人」
@@ -124,6 +127,30 @@ export DSH_QQ_SECRET='你的AppSecret'
 
 > ⚠️ 安全：本插件背后是带 bash/文件/子代理的全量 agent。白名单**空 = 全部拒绝**（fail-closed），`'*'` 是显式放行。联调用 `'*'`，上线务必收紧。
 
+## QQ 上下文压缩（带宽优化，v0.1.5）
+
+**问题**：dsh 每次调用 LLM 都会上传该会话累积的完整上下文。在低带宽服务器（如腾讯云 ~1-2Mbps 实例）上，活跃会话期间上行持续打满，触发带宽告警。
+
+**机制**：dsh 内置 `compaction-basic` 会在上下文达到阈值时用摘要压缩旧内容。框架 standard preset 阈值为 0.8（deepseek-v4-flash 上下文窗口 1M token → 800K 才压缩，压缩后仍保留 160K）。本插件将 QQ 会话改挂内置 `qq` preset，阈值提前到 **0.3 / 保留 0.1**：
+
+- 每次 LLM 调用上传的上下文从 ~160K-800K token 收敛到 **~100K-300K**（约 2.5x 下降）；
+- 压缩摘要调用本身也封顶在 300K，成本可控；
+- **只影响 QQ 会话**：挂载哪个 preset 由 `agentPreset` 决定，原生 dsh/dst、dsh-web、dsh-tui 仍用框架自带 standard preset，行为完全不变。
+
+**文件与部署**：
+
+| 文件 | 作用 |
+|---|---|
+| `presets/qq/agent.cordis.yml` | standard 的副本 + compaction-basic config（阈值/保留比例） |
+| `presets/qq/preset.yml` | 预设展示元数据 |
+| `core/preset-install.js` | 启动时自动同步 `presets/qq/` → `$DSH_HOME/.agent-presets/qq/`（内容哈希比对幂等，0444 只读防 loader 回写） |
+
+会话仍走 `agentPresets.mount()` 官方通道（standing mount / 子代理 `composeFrom` / mount 审计全部保留），不绕开框架。
+
+**调参**：编辑 `presets/qq/agent.cordis.yml` 中 `compaction-basic` 的 `thresholdRatio`（触发阈值）与 `retainRatio`（压缩后保留比例，必须小于阈值），重启后插件自动同步生效。`presetAutoInstall: false` 可关闭自动安装（不推荐）。
+
+**验证**：启动日志出现「已同步内置 qq preset …」；会话文件（`$DSH_HOME/sessions/…/session.jsonl.zstd`）出现 `compaction/start` / `compaction/end` 事件即压缩已触发。
+
 ## 使用
 
 - 私聊：直接给机器人发消息（沙箱内需为测试人员）
@@ -144,6 +171,7 @@ router.js → 标准消息对象 { id, chat, chatKey, content, replyTo }
 acl.js（fail-closed 白名单 + 频控）→ slash.js（命令拦截）→ session-map.js
   │   create: workspaceRegistry.create(cwd) → agents.create({sessionId, meta:{cwd, agentPreset},
   │           agentOptions:{provider,model}, setup: agentCtx => agentPresets.mount(agentCtx, preset)})
+  │           （v0.1.5: preset 由 core/preset-install.js 自动安装到 $DSH_HOME/.agent-presets/qq/）
   │   resume: agents.resume({resumeSessionId, setup: mount})（懒恢复，映射持久化 .qq-sessions.json）
   ▼
 agent.followup(createUserMessage({content, source:{kind:'plugin', plugin:'dsh-im-qq'}}))
